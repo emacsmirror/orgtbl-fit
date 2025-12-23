@@ -282,21 +282,120 @@ A last column is added, for the target column COL."
                                  (nth (cl-position (cadr c) header)
                                       row)))))))
 
-(defun orgtbl-fit--add-formula-to-spreadsheet (model header col)
+(defun orgtbl-fit--precision (ns)
+  "Retrieve the precision and magnitude of NS, a string representing a number.
+Those quantities are expressed in decimal places.
+Precision points to the last significant digit of NS.
+Magnitude points to the first significant digit of NS.
+Trailing zeros are not considered significant."
+  (and
+   (string-match
+    (rx
+     bos
+     (? (any "+-"))
+     (group (* (any "0-9")))
+     (? "." (group (*? (any "0-9"))) (* "0"))
+     (? "e" (group (? (any "+-")) (* (any "0-9"))))
+     eos)
+    ns)
+   (let* ((ante (match-string 1 ns))
+          (post (match-string 2 ns))
+          (expo (match-string 3 ns))
+          (expo (if expo (string-to-number expo) 0))
+          (prec (+ (if post (- (length post)) 0) expo))
+          (magn (+ (length ante) expo)))
+     (unless post
+       (string-match (rx (group (* "0")) eos) ante)
+       (setq prec (+ prec (length (match-string 1 ante)))))
+     (cons prec magn))))
+
+;;; run this to test orgtbl-fit--precision on a few examples
+(if nil
+    (cl-loop
+     for row in
+     (cons
+      '(ns prec . magn)
+      (cl-loop
+       for ns in
+       '("1.23" "1.23e20" "1.23e-20" "1230e20" "-451" "+451.2"
+         "451.23" "-1" "-45" "-45.5666" "4000" "451." "450."
+         ".55" "9.87e-1" "32.45000000" "-6.7500")
+       collect (cons ns (orgtbl-fit--precision ns))))
+     do
+     (insert (format ";; %12s %4s %4s\n" (car row) (cadr row) (cddr row)))))
+;;           ns prec magn
+;;         1.23   -2    1
+;;      1.23e20   18   21
+;;     1.23e-20  -22  -19
+;;      1230e20   21   24
+;;         -451    0    3
+;;       +451.2   -1    3
+;;       451.23   -2    3
+;;           -1    0    1
+;;          -45    0    2
+;;     -45.5666   -4    2
+;;         4000    3    4
+;;         451.    0    3
+;;         450.    0    3
+;;          .55   -2    0
+;;      9.87e-1   -3    0
+;;  32.45000000   -2    2
+;;      -6.7500   -2    1
+
+(defun orgtbl-fit--evaluate-precision-of-column (col table)
+  "Evaluate the precision of values in column COL of table TABLE.
+Return a formatter suitable for displaying that much precision."
+  (let* ((prec  9999999)
+         (magn -9999999))
+    (cl-loop
+     for row in table
+     if (consp row)
+     for pair = (orgtbl-fit--precision (nth (1- col) row))
+     if pair
+     do
+     (setq prec (min prec (1- (car pair))))
+     (setq magn (max magn     (cdr pair))))
+    (cond
+     ;; fixed format for usual values: 1.23 → %.2f
+     ((< -9 prec 0) (format "%%.%df" (abs prec)))
+     ;; fixed format for large values: 345000 → %.0f
+     ((<= 0 prec 12) "%.0f")
+     ;; exponent format for very large or very small values
+     ;; 2.36e20 or 5.89e-20 → %.3g
+     ;; note that in this case, there is no suitable formatter for displaying
+     ;; digits up to a specified common precision for the whole column
+     ;; instead, we display an amount of significant digits,
+     ;; the same for all values in the columns.
+     (t (format "%%#.%dg" (- magn prec))))))
+
+(defun orgtbl-fit--add-formula-to-spreadsheet (model header col fmt)
   "Add regression fit MODEL to the table spreadsheet.
 It will be applied to the before-last column.
 Also add a formula to compute difference between observed and
 predicted values.  It will be applied on the last column.
 HEADER is used to locate the two new columns.
-COL is the target columns which hold observations."
+COL is the target columns which hold observations.
+FMT is a format to specify precision of numerical predictions."
   (org-table-store-formulas
-   (cons (cons (format "$%d" (1+ (length header)))
-               (math-format-value model))
-         (cons (cons (format "$%d" (+ 2 (length header)))
-                     (format "$%d-$%d"
-                             (1+ (length header))
-                             col))
-               (org-table-get-stored-formulas)))))
+   `(
+     (,(format "$%d" (1+ (length header)))
+      .
+      ,(format "%s;%s"
+               (math-format-value 
+                (if t model
+                  ;; use this alternative expression which may be simpler
+                  ;; if there are symbolic values in the table
+                  (math-simplify
+                   (calcFunc-expand
+                    (calcFunc-expand model)))))
+               fmt))
+     (,(format "$%d" (+ 2 (length header)))
+      .
+      ,(format "$%d-$%d;%s"
+               (1+ (length header))
+               col
+               fmt))
+     ,@(org-table-get-stored-formulas))))
 
 ;;;###autoload
 (defun orgtbl-fit (&optional model)
@@ -312,6 +411,7 @@ It mentions only columns containing numerical values."
   (let* ((col (org-table-current-column))
          (header)
          (table)
+         (calctable)
          (header-p) ;; nil or row number of header
          (cols   (list 'vec))
          (params (list 'vec))
@@ -358,7 +458,7 @@ It mentions only columns containing numerical values."
 
     ;; Extract data from `table' and put it in Calc format.
     ;; Not all columns are kept, and their ordering may differ.
-    (setq table
+    (setq calctable
           (orgtbl-fit--extract-data-from-table table header cols col))
 
     ;; Here is the heart of this package:
@@ -370,7 +470,7 @@ It mentions only columns containing numerical values."
           (calcFunc-fit model  ;; orgtblfit0 + orgtblfit1*c1 + orgtblfit2*c2…
                         cols   ;;     c1, c2, c3…
                         params ;; orgtblfit0, orgtblfit1, orgtblfit2…
-                        table))
+                        calctable))
 
     ;; Replace variables by $ forms using the `header'.
     ;; For example, if `header' is (a b c d ...),
@@ -391,7 +491,9 @@ It mentions only columns containing numerical values."
     ;; as a spreadsheet formula in the new column.
     ;; Then add the difference between computed and target values
     ;; in the other column.
-    (orgtbl-fit--add-formula-to-spreadsheet model header col)
+    (orgtbl-fit--add-formula-to-spreadsheet
+     model header col
+     (orgtbl-fit--evaluate-precision-of-column col table))
   
     ;; Restore cursor position where it was.
     (org-table-goto-column col)
